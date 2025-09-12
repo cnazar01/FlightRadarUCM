@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+
+# Spark
+.metastore/
+.derby/
+.sparkStaging/
+*.iml
+*.db
+
+# VS Code / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Keys
+*.key
+*.pem
+*.pfx
+*.cer
+*.jks
