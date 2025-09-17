@@ -1,12 +1,15 @@
 # Source/Jobs/fr24_tools.py
 from __future__ import annotations
 import os
+import re
 from typing import Literal, Sequence, Any, Iterable
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv, find_dotenv
 from fr24sdk.client import Client
 from fr24sdk.exceptions import AuthenticationError, BadRequestError
+from functools import lru_cache
+
 
 # Load environment once (local dev)
 load_dotenv(find_dotenv(), override=False)
@@ -31,26 +34,36 @@ AIRPORT_TZ = {
     "LEBL": "Europe/Madrid",
 }
 
+
+IATA_FLIGHT_RE = re.compile(r'^[A-Z]{2}\d{1,4}[A-Z]?$')
+ICAO_CALLSIGN_RE = re.compile(r'^[A-Z]{3}\d+$')
+
+
 # ---------- helpers ----------
+
+@lru_cache(maxsize=2048)
+def _to_iata(code: str | None) -> str | None:
+    """
+    Return a 3-letter IATA code for an airport code.
+    - If it's already 3 letters -> return as-is.
+    - If it's 4-letter ICAO -> resolve to IATA via FR24 airport lookup.
+    - Fallback: return the original code.
+    """
+    if not code:
+        return None
+    s = str(code).strip().upper()
+    if len(s) == 3:
+        return s
+    if len(s) == 4:
+        try:
+            info = resolve_airport(s)   # uses FR24 SDK
+            iata = _first(info, ["iata", "iata_code", "IATA"])
+            return (iata or s)
+        except Exception:
+            return s
+    return s
+
 # Local timezones for airports you care about (IATA and ICAO)
-
-def _best_tz(explicit_tz: str | None, orig: str | None, dest: str | None) -> str:
-    """
-    Choose a timezone in this order:
-      1) explicit tz (if provided)
-      2) destination airport's zone
-      3) origin airport's zone
-      4) UTC
-    """
-    if explicit_tz:
-        return explicit_tz
-    for code in (dest, orig):
-        if code:
-            tz = AIRPORT_TZ.get(str(code).upper())
-            if tz:
-                return tz
-    return "UTC"
-
 
 def flight_status(leg) -> tuple[str, str | None]:
     """
@@ -166,42 +179,42 @@ def _field(rec, *names):
             return val
     return None
 
-
 def flight_id(rec) -> str:
     """
-    Prefer API 'flight' (IATA-style like 'UA2476'); fall back to 'callsign'.
-    If only a callsign exists (e.g. AAL2401), try mapping to IATA (AA2401).
+    Prefer canonical IATA 'flight' (e.g. 'TO4780').
+    Fall back to callsign; if callsign looks ICAO, try mapping to IATA.
     """
-    f = (_field(rec, "flight") or "").strip()
-    if f:
+    f = (_field(rec, "flight") or "").strip().upper()
+    if f and IATA_FLIGHT_RE.match(f):
         return f
 
-    cs = (_field(rec, "callsign") or "").strip()
+    cs = (_field(rec, "callsign") or "").strip().upper()
     if cs:
-        # Try to map callsign (ICAO+number) -> IATA+number
-        try:
-            from .bot import callsign_to_iata_flight
-            mapped = callsign_to_iata_flight(cs)
-            if mapped:
-                return mapped
-        except Exception:
-            pass
+        if ICAO_CALLSIGN_RE.match(cs):
+            try:
+                from .bot import callsign_to_iata_flight
+                mapped = callsign_to_iata_flight(cs)
+                if mapped:
+                    return mapped
+            except Exception:
+                pass
         return cs
+
     return "Flight"
-
-
 
 
 def line_for_leg(leg, direction: str, tz: str | None) -> str:
     """
-    Friendly one-liner using actual movement status.
-    - If we have a landing time -> 'arrived at ... at <local time>'
-    - If not and flight is still operating -> 'en route to ...' (optionally 'departed <time>')
-    - Otherwise -> gentle fallback without forcing a time string
+    Friendly one-liner using actual movement status, showing airports in IATA.
     """
     fid  = flight_id(leg)
-    orig = _field(leg, "orig_icao", "orig", "from_icao", "from") or "?"
-    dest = _field(leg, "dest_icao", "dest", "to_icao", "to") or "?"
+
+    # read whatever is present, then prefer IATA
+    orig_any = _field(leg, "orig_icao", "orig", "from_icao", "from") or "?"
+    dest_any = _field(leg, "dest_icao", "dest", "to_icao", "to") or "?"
+    orig = _to_iata(orig_any) or orig_any or "?"
+    dest = _to_iata(dest_any) or dest_any or "?"
+
     direction = (direction or "both").lower()
 
     status, when_iso = flight_status(leg)
@@ -211,7 +224,6 @@ def line_for_leg(leg, direction: str, tz: str | None) -> str:
         if status == "arrived":
             return f"{fid} arrived at {dest}" + (f" at {when_txt}" if when_txt else "")
         if status == "enroute":
-            # keep it short; if you want the departure time, append: + (f', departed {when_txt}' if when_txt else '')
             return f"{fid} en route to {dest}"
         return f"{fid} arriving at {dest}"
 
@@ -228,7 +240,6 @@ def line_for_leg(leg, direction: str, tz: str | None) -> str:
     if status == "enroute":
         return f"{fid} en route to {dest}"
     return f"{fid} arriving at {dest}"
-
 
 
 def _as_dict(obj):
@@ -255,6 +266,29 @@ def _best_time_key(rec, _first):
         datetime.min.replace(tzinfo=timezone.utc)
     )
 
+def flight_summary_by_callsign(
+    callsign: str,
+    dt_from: datetime | None = None,
+    dt_to: datetime | None = None,
+):
+    """
+    Query FR24 flight summary using a callsign (e.g., 'TVF36TM').
+    The response will include the canonical IATA 'flight' code (e.g., 'TO4780').
+    """
+    try:
+        with _client() as c:
+            return c.flight_summary.get_light(
+                callsigns=[callsign],
+                flight_datetime_from=_fmt(dt_from),
+                flight_datetime_to=_fmt(dt_to),
+            ).data
+    except BadRequestError as e:
+        # Keep the same style as flight_summary(...)
+        raise ValueError(
+            "Flight summary (by callsign) needs a time window like "
+            "'from 2025-09-01T00:00:00 to 2025-09-02T00:00:00' (UTC)."
+        ) from e
+
 def flight_summary_dicts(flight_id_str: str,
                          dt_from: datetime | None = None,
                          dt_to: datetime | None = None) -> list[dict]:
@@ -269,30 +303,38 @@ def flight_summary_dicts(flight_id_str: str,
 
 def enrich_with_summary_time(leg):
     """
-    If the live row lacks landing/arrival time, fetch a recent summary for the
-    same flight and merge the best time fields back into the leg.
+    If the live row lacks landing/arrival time, or only has a callsign,
+    fetch a recent summary (prefer by callsign) and merge useful fields.
+    Also copy the canonical IATA 'flight' from summary when available.
     """
     d = _as_dict(leg)
 
-    # Already has a usable time? keep as-is
-    if d.get("datetime_landed") or d.get("datetime_arrival"):
-        return d
+    # If we already have a usable time, we still might fix the flight number below,
+    # so don't early-return yet. We will attempt to merge regardless.
 
-    # Choose an identifier to query summary
-    fid = (d.get("flight") or "").strip()
-    if not fid:
-        # try callsign -> IATA (e.g. AAL2401 -> AA2401)
-        from .bot import callsign_to_iata_flight  # safe local import to avoid cycles
-        fid = callsign_to_iata_flight(d.get("callsign"))
+    # Choose identifiers
+    live_flight = (d.get("flight") or "").strip().upper()
+    live_callsign = (d.get("callsign") or "").strip().upper()
 
-    if not fid:
-        return d  # nothing we can query
+    # Decide what to query:
+    # Prefer callsign if that's what we have (live endpoint usually gives callsign).
+    use_callsign = bool(live_callsign)
+    use_iata_flight = bool(live_flight and IATA_FLIGHT_RE.match(live_flight))
 
     now = datetime.now(timezone.utc)
+    rows = []
+
     try:
-        rows = flight_summary(fid, now - timedelta(days=2), now + timedelta(days=1)) or []
+        if use_callsign:
+            rows = flight_summary_by_callsign(live_callsign,
+                                              now - timedelta(days=2),
+                                              now + timedelta(days=1)) or []
+        elif use_iata_flight:
+            rows = flight_summary(live_flight,
+                                  now - timedelta(days=2),
+                                  now + timedelta(days=1)) or []
     except Exception:
-        return d
+        rows = []
 
     if not rows:
         return d
@@ -300,7 +342,7 @@ def enrich_with_summary_time(leg):
     # pick the most relevant leg from summary
     best = sorted(rows, key=lambda r: _best_time_key(r, _first))[-1]
 
-    # merge useful fields (don’t overwrite non-empty values in d)
+    # merge useful fields (do not overwrite non-empty values in d)
     def _merge(k):
         v = _first(best, [k])
         if v and not d.get(k):
@@ -308,12 +350,19 @@ def enrich_with_summary_time(leg):
 
     for k in (
         "datetime_landed", "datetime_landing", "datetime_arrival",
-        "datetime_takeoff", "orig_icao", "orig", "dest_icao", "dest",
-        "flight", "callsign", "flight_ended" 
+        "datetime_takeoff", "orig_icao", "orig", "orig_iata",
+        "dest_icao", "dest", "dest_iata",
+        "flight", "callsign", "flight_ended"
     ):
         _merge(k)
 
+    # If the summary returned a canonical IATA 'flight', prefer it over callsign
+    summary_flight = (_first(best, ["flight"]) or "").strip().upper()
+    if summary_flight and IATA_FLIGHT_RE.match(summary_flight):
+        d["flight"] = summary_flight
+
     return d
+
 
 
 # ---------- client factory ----------

@@ -18,7 +18,7 @@ IATA3 = re.compile(r"\b([A-Z]{3})\b")
 @dataclass
 class Query:
     intent: Intent
-    airport: Optional[str] = None      # JFK, XPL, or name like "Kennedy"
+    airport: Optional[str] = None      # MAD, XPL, or name like "Madrid"
     direction: str = "both"            # inbound | outbound | both
     flight_id: Optional[str] = None    # e.g. AA3165
     limit: int = 10
@@ -38,7 +38,7 @@ def parse_query(text: str) -> Query:
     limit = max(1, min(limit, 50))
 
     # flight id (e.g., AA3165, CM2385)
-    m_fid = re.search(r"\b([A-Z]{2}\d{2,4}[A-Z]?)\b", text.upper())
+    m_fid = re.search(r"\b([A-Z0-9]{2}\d{1,4}[A-Z]?)\b", text.upper())
 
     # airport by code right after a preposition (preferred)
     m_iata_after_prep = re.search(r"(?:\bat|\bfrom|\bto|\bin)\s+([A-Z]{3})\b", text.upper())

@@ -229,8 +229,9 @@ def answer(user_text: str, tz: Optional[str] = None) -> str:
             targets = {c for c in (iata, icao, q.airport.upper()) if c}
 
             def _matches_leg(leg):
-                orig = _first(leg, ["orig_icao", "orig"])
-                dest = _first(leg, ["dest_icao", "dest"])
+                orig = _first(leg, ["orig_iata", "from_iata", "orig", "from", "orig_icao", "from_icao"])
+                dest = _first(leg, ["dest_iata", "to_iata", "dest", "to", "dest_icao", "to_icao"])
+
                 if q.direction == "inbound":
                     return dest in targets
                 if q.direction == "outbound":
@@ -260,7 +261,7 @@ def answer(user_text: str, tz: Optional[str] = None) -> str:
         s = sorted(legs, key=_sort_key)[-1]
 
         # timezone to format with (user’s if provided, else airport)
-        dest_code = _first(s, ["dest_icao", "dest", "to_icao", "to"])
+        dest_code = _first(s, ["dest_iata", "to_iata", "dest", "to", "dest_icao", "to_icao"])
         tz_str = _best_tz(getattr(q, "tz", None), dest_code)
 
         # pretty line
@@ -297,7 +298,7 @@ def answer(user_text: str, tz: Optional[str] = None) -> str:
             return f"I couldn’t resolve a flight id for {q.flight_id}."
 
         # 3) Pick a timezone (user > dest airport > UTC)
-        dest_code = _first(s, ["dest_icao", "dest", "to_icao", "to"])
+        dest_code = _first(s, ["dest_iata", "to_iata", "dest", "to", "dest_icao", "to_icao"])
         tz_str = _best_tz(getattr(q, "tz", None), dest_code)
 
         # 4) Fetch events for that FR24 id
